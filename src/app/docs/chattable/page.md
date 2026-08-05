@@ -75,23 +75,49 @@ Next we need a way to create messages and get a response from OpenAI. Generally 
 class CreateChatMessageAndStream < SidekiqJob
   def perform(args)
     chat_id, user_id, content, model = args.values_at("chat_id", "user_id", "content", "model")
-
-    # Find the user.
     user = User.find(user_id)
-
-    # Find the chat.
     chat = user.chats.find(chat_id)
-
-    # Create the new user message.
     chat.messages.create(content: content, role: "user")
 
-    # Get the response from OpenAI.
-    chat.run(model: model)
+    call_openai(chat: chat, model: model)
+  end
+
+  private
+
+  def call_openai(chat:, model:)
+    OpenAI::Client.new.chat(
+      parameters: {
+        model: model,
+        messages: chat.messages.map { |m| { role: m.role, content: m.content } },
+        temperature: 0.7,
+        stream: stream_proc(chat:)
+      }
+    )
+    @message.save!
+  end
+
+  def create_message(chat:)
+    message = chat.messages.create(role: 'assistant', content: '')
+    message.broadcast_created
+    message
+  end
+
+  def stream_proc(chat:)
+    @message = create_message(chat:)
+    buffer = ''
+    proc do |chunk, _bytesize|
+      new_content = chunk.dig('choices', 0, 'delta', 'content')
+      if new_content
+        buffer += new_content
+        @message.content = buffer
+        @message.broadcast_updated
+      end
+    end
   end
 end
 ```
 
-`Chat#run` will create a response message with `role: "assistant"` and stream updates from OpenAI to it, triggering `User#ai_engine_on_message_create` and `User#ai_engine_on_message_update`, the latter once per chunk as it's received.
+`CreateChatMessageAndStream` will create a response message with `role: "assistant"` and stream updates from OpenAI to it. By buffering the content in memory and only saving to the database once the stream is complete, we avoid hitting the database for every chunk while still broadcasting real-time updates via `broadcast_updated`.
 
 ## User Interface [Optional]
 
